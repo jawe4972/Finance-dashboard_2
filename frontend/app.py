@@ -1,11 +1,11 @@
 import dash
 from dash import dcc, html, Input, Output, State, dash_table
 import dash_bootstrap_components as dbc
-import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
 import requests
 from datetime import datetime, timedelta
+import json
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
 server = app.server
@@ -19,25 +19,28 @@ app.layout = dbc.Container([
     dbc.Row(dbc.Col(html.H1("Personal Finance Dashboard", className="text-center my-4"))),
     
     dbc.Tabs([
-        dbc.Tab(label="Overview", children=[
+        dbc.Tab(label="Financial Overview", children=[
             dbc.Row([
                 dbc.Col([
                     dcc.Graph(id='daily-spending-chart'),
                     dcc.DatePickerRange(
                         id='date-range',
-                        min_date_allowed=(datetime.now() - timedelta(days=365)).date,
-                        max_date_allowed=datetime.now().date,
-                        start_date=(datetime.now() - timedelta(days=30)).date,
-                        end_date=datetime.now().date
+                        min_date_allowed=(datetime.now() - timedelta(days=365)).date(),
+                        max_date_allowed=datetime.now().date(),
+                        start_date=(datetime.now() - timedelta(days=30)).date(),
+                        end_date=datetime.now().date()
                     )
                 ], width=8),
                 dbc.Col([
                     dcc.Graph(id='category-pie'),
-                    html.Div(id='alerts-container', className="mt-3")
+                    html.Div(id='alerts-container', className="mt-3 alert alert-warning")
                 ], width=4)
             ]),
             dbc.Row([
                 dbc.Col(dcc.Graph(id='forecast-chart'), width=12)
+            ]),
+            dbc.Row([
+                dbc.Col(dcc.Graph(id='forecast-components'), width=12)
             ])
         ]),
         
@@ -46,6 +49,7 @@ app.layout = dbc.Container([
                 dbc.Col([
                     dcc.Dropdown(
                         id='category-selector',
+                        options=[],
                         multi=True,
                         placeholder="Select categories"
                     ),
@@ -53,15 +57,25 @@ app.layout = dbc.Container([
                 ], width=8),
                 dbc.Col([
                     dcc.Graph(id='weekday-heatmap'),
-                    dcc.Graph(id='monthly-comparison')
+                    dcc.RadioItems(
+                        id='period-selector',
+                        options=[
+                            {'label': 'Daily', 'value': 'daily'},
+                            {'label': 'Weekly', 'value': 'weekly'},
+                            {'label': 'Monthly', 'value': 'monthly'}
+                        ],
+                        value='monthly',
+                        inline=True
+                    ),
+                    dcc.Graph(id='period-comparison')
                 ], width=4)
             ])
         ]),
         
-        dbc.Tab(label="Budget Settings", children=[
+        dbc.Tab(label="Budget & Alerts", children=[
             dbc.Row([
                 dbc.Col([
-                    html.H3("Set Budget Limits"),
+                    html.H3("Budget Settings"),
                     dash_table.DataTable(
                         id='budget-table',
                         columns=[
@@ -84,7 +98,7 @@ app.layout = dbc.Container([
                         ],
                         value=['email']
                     ),
-                    html.Div(id='alert-status', className="mt-3")
+                    html.Div(id='alert-status', className="mt-3 alert alert-info")
                 ], width=6)
             ])
         ])
@@ -96,7 +110,8 @@ app.layout = dbc.Container([
         n_intervals=0
     ),
     dcc.Store(id='transaction-data'),
-    dcc.Store(id='forecast-data')
+    dcc.Store(id='forecast-data'),
+    dcc.Store(id='analysis-data')
 ], fluid=True)
 
 # Callbacks
@@ -136,22 +151,41 @@ def update_forecast_data(n):
     return response.json()
 
 @app.callback(
+    Output('analysis-data', 'data'),
+    [Input('interval-component', 'n_intervals')]
+)
+def update_analysis_data(n):
+    response = requests.get(
+        f"{API_BASE_URL}/transactions/analysis/{DEFAULT_USER_ID}",
+        params={"period": "monthly"}
+    )
+    return response.json()
+
+@app.callback(
     Output('daily-spending-chart', 'figure'),
     [Input('transaction-data', 'data')]
 )
 def update_daily_spending_chart(data):
     df = pd.DataFrame(data)
-    df['date'] = pd.to_datetime(df['date'])
+    if len(df) == 0:
+        return go.Figure()
     
-    fig = px.line(
-        df.groupby('date')['amount'].sum().reset_index(),
-        x='date', y='amount',
-        title="Daily Spending Trend",
-        labels={'amount': 'Amount ($)', 'date': 'Date'}
+    df['date'] = pd.to_datetime(df['date'])
+    daily_df = df.groupby('date')['amount'].sum().reset_index()
+    
+    fig = go.Figure(
+        go.Scatter(
+            x=daily_df['date'],
+            y=daily_df['amount'],
+            mode='lines+markers',
+            name="Daily Spending"
+        )
     )
     
     fig.update_layout(
-        xaxis=dict(rangeslider=dict(visible=True)),
+        title="Daily Spending Trend",
+        xaxis_title="Date",
+        yaxis_title="Amount ($)",
         hovermode="x unified"
     )
     
@@ -163,70 +197,107 @@ def update_daily_spending_chart(data):
 )
 def update_category_pie(data):
     df = pd.DataFrame(data)
-    
     if len(df) == 0:
-        return px.pie(title="No data available")
+        return go.Figure()
     
-    category_totals = df.groupby('category')['amount'].sum().reset_index()
+    category_df = df.groupby('category')['amount'].sum().reset_index()
     
-    fig = px.pie(
-        category_totals,
-        values='amount',
-        names='category',
-        title="Spending by Category"
+    fig = go.Figure(
+        go.Pie(
+            labels=category_df['category'],
+            values=category_df['amount'],
+            hole=0.3,
+            textinfo='label+percent'
+        )
     )
     
+    fig.update_layout(title="Spending by Category")
     return fig
 
 @app.callback(
-    Output('forecast-chart', 'figure'),
+    [Output('forecast-chart', 'figure'),
+     Output('forecast-components', 'figure'),
+     Output('alerts-container', 'children')],
     [Input('forecast-data', 'data')]
 )
-def update_forecast_chart(data):
+def update_forecast_charts(data):
     if not data or 'forecast' not in data:
+        return go.Figure(), go.Figure(), "No forecast data available"
+    
+    # Main forecast chart
+    forecast_fig = go.Figure(data['visualizations']['forecast_plot'])
+    
+    # Components chart
+    components_fig = go.Figure(data['visualizations']['components_plot']) if data['visualizations']['components_plot'] else go.Figure()
+    
+    # Alerts
+    alerts = []
+    if data.get('alerts', {}).get('potential_issues'):
+        alerts.append(html.H4("Alerts:"))
+        for alert in data['alerts']['potential_issues']:
+            alerts.append(html.P(alert, className="alert alert-danger"))
+    
+    return forecast_fig, components_fig, alerts
+
+@app.callback(
+    [Output('weekday-heatmap', 'figure'),
+     Output('period-comparison', 'figure'),
+     Output('category-selector', 'options')],
+    [Input('analysis-data', 'data'),
+     Input('period-selector', 'value')]
+)
+def update_analysis_charts(data, period):
+    if not data:
+        return go.Figure(), go.Figure(), []
+    
+    # Heatmap
+    heatmap_fig = go.Figure(data['heatmap'])
+    
+    # Period comparison
+    period_fig = go.Figure(data['period_analysis'])
+    period_fig.update_layout(title=f"Spending by {period.capitalize()}")
+    
+    # Category options
+    category_options = [
+        {'label': cat, 'value': cat} 
+        for cat in pd.DataFrame(data['category_breakdown']['data'][0]['labels']).tolist()
+    ]
+    
+    return heatmap_fig, period_fig, category_options
+
+@app.callback(
+    Output('category-trend-chart', 'figure'),
+    [Input('transaction-data', 'data'),
+     Input('category-selector', 'value')]
+)
+def update_category_trend(data, selected_categories):
+    df = pd.DataFrame(data)
+    if len(df) == 0 or not selected_categories:
         return go.Figure()
     
-    forecast_df = pd.DataFrame(data['forecast'])
-    forecast_df['ds'] = pd.to_datetime(forecast_df['ds'])
+    df['date'] = pd.to_datetime(df['date'])
+    filtered_df = df[df['category'].isin(selected_categories)]
     
     fig = go.Figure()
-    
-    fig.add_trace(go.Scatter(
-        x=forecast_df['ds'],
-        y=forecast_df['yhat'],
-        name="Forecast",
-        line=dict(color='royalblue', width=2)
-    ))
-    
-    if 'yhat_lower' in forecast_df.columns and 'yhat_upper' in forecast_df.columns:
-        fig.add_trace(go.Scatter(
-            x=forecast_df['ds'],
-            y=forecast_df['yhat_upper'],
-            fill=None,
-            mode='lines',
-            line=dict(width=0),
-            showlegend=False
-        ))
+    for category in selected_categories:
+        category_df = filtered_df[filtered_df['category'] == category]
+        daily_df = category_df.groupby('date')['amount'].sum().reset_index()
         
         fig.add_trace(go.Scatter(
-            x=forecast_df['ds'],
-            y=forecast_df['yhat_lower'],
-            fill='tonexty',
+            x=daily_df['date'],
+            y=daily_df['amount'],
             mode='lines',
-            line=dict(width=0),
-            fillcolor='rgba(65, 105, 225, 0.2)',
-            name="Confidence Interval"
+            name=category
         ))
     
     fig.update_layout(
-        title="30-Day Cash Flow Forecast",
+        title="Category Spending Trends",
         xaxis_title="Date",
         yaxis_title="Amount ($)",
-        hovermode="x"
+        hovermode="x unified"
     )
     
     return fig
 
 if __name__ == '__main__':
     app.run_server(debug=True)
-
